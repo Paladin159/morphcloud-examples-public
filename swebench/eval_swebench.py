@@ -397,6 +397,20 @@ def process_instances_distributed(
     """
     Create a thread pool to process the test specifications and run each instance on Morph Cloud.
     """
+    from rich.console import Console
+    from rich.progress import (
+        Progress, 
+        SpinnerColumn,
+        TextColumn, 
+        BarColumn, 
+        TaskProgressColumn, 
+        TimeElapsedColumn, 
+        TimeRemainingColumn,
+        MofNCompleteColumn
+    )
+    
+    console = Console()
+    
     run_test_specs: List[TestSpec] = []
     test_specs: List[TestSpec] = list(map(make_test_spec, dataset))
 
@@ -409,35 +423,92 @@ def process_instances_distributed(
             continue
         run_test_specs.append(test_spec)
 
+    if not run_test_specs:
+        console.print("[green]All instances have already been evaluated.[/green]")
+        # Generate the run report
+        make_run_report(predictions, full_dataset, run_id)
+        return
+        
+    console.print(f"[blue]Evaluating {len(run_test_specs)} instances with {max_workers} workers[/blue]")
     results: List[TestOutput] = []
-    if run_test_specs:
+    
+    # Create a progress bar with Rich instead of tqdm
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}[/bold blue]"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console
+    )
+    
+    with progress:
+        # Add the overall progress task
+        overall_task = progress.add_task("[bold]Overall Progress", total=len(run_test_specs))
+        
+        # Create a dictionary to track individual tasks
+        instance_tasks = {}
+        
         # Run instances that haven't been run yet using a thread pool
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Use executor.submit to run the function with multiple arguments
-            futures = [
-                executor.submit(
+            # Submit all tasks to the executor
+            futures = {}
+            
+            for test_spec in run_test_specs:
+                instance_id = test_spec.instance_id
+                # Create a task for this instance
+                task_id = progress.add_task(f"[cyan]{instance_id}[/cyan]: Pending...", total=1, visible=True)
+                instance_tasks[instance_id] = task_id
+                
+                # Submit the job
+                future = executor.submit(
                     process_instance_morph,
                     test_spec,
-                    predictions[test_spec.instance_id],
+                    predictions[instance_id],
                     run_id,
                 )
-                for test_spec in run_test_specs
-            ]
+                futures[future] = instance_id
+            
             # As each future completes, process the result
             for future in as_completed(futures):
+                instance_id = futures[future]
                 try:
                     result = future.result()
                     results.append(result)
-                    print(
-                        f"Instance {result.instance_id} completed (errored: {result.errored})"
-                    )
+                    
+                    # Update status for this instance
+                    if result.errored:
+                        progress.update(
+                            instance_tasks[instance_id], 
+                            description=f"[red]✗ {instance_id}: Failed[/red]",
+                            completed=1
+                        )
+                    else:
+                        progress.update(
+                            instance_tasks[instance_id], 
+                            description=f"[green]✓ {instance_id}: {result.log_dir.name}[/green]",
+                            completed=1
+                        )
                 except Exception as e:
                     # Handle exceptions from individual tasks
-                    print(f"Error processing an instance: {e}")
+                    progress.update(
+                        instance_tasks[instance_id], 
+                        description=f"[bold red]✗ {instance_id}: ERROR - {str(e)[:30]}...[/bold red]",
+                        completed=1
+                    )
+                
+                # Update the overall progress
+                progress.update(overall_task, advance=1)
 
-    # No need to save logs here as it's already done in process_instance_morph
-    # Just print a summary and generate the run report
+    # Print summary after completion
+    console.print(f"[bold green]Evaluation complete! Processed {len(results)} instances.[/bold green]")
+    
+    # Generate the run report
+    console.print("[blue]Generating final evaluation report...[/blue]")
     make_run_report(predictions, full_dataset, run_id)
+    console.print("[bold green]✅ Report generated successfully![/bold green]")
 
 
 def get_dataset_from_preds(
@@ -540,9 +611,9 @@ def get_dataset_from_preds(
 
 def main(
     dataset_name: str,
-    split: str,
     predictions_path: str,
     run_id: str,
+    split: str = "test",
     max_workers: int = 4,
     rewrite_reports: bool = False,
     report_dir: str = ".",
@@ -584,4 +655,80 @@ def main(
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run SWE-bench evaluation harness for the given dataset and predictions.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        "--dataset_name", 
+        type=str, 
+        required=True,
+        help="The name of the dataset to use (e.g., princeton-nlp/SWE-bench)"
+    )
+    parser.add_argument(
+        "--predictions_path", 
+        type=str, 
+        required=True,
+        help="Path to the predictions file, or 'gold' to use gold patches"
+    )
+    parser.add_argument(
+        "--run_id", 
+        type=str, 
+        required=True,
+        help="Unique identifier for this evaluation run"
+    )
+    
+    # Optional arguments
+    parser.add_argument(
+        "--split", 
+        type=str, 
+        default="test",
+        help="Dataset split to use (e.g., test, train)"
+    )
+    parser.add_argument(
+        "--max_workers", 
+        type=int, 
+        default=4,
+        help="Maximum number of concurrent evaluation workers"
+    )
+    parser.add_argument(
+        "--rewrite_reports", 
+        action="store_true",
+        help="Whether to rewrite existing reports"
+    )
+    parser.add_argument(
+        "--report_dir", 
+        type=str, 
+        default=".",
+        help="Directory to store evaluation reports"
+    )
+    parser.add_argument(
+        "--instance_ids", 
+        type=str, 
+        nargs="+",
+        help="Specific instance IDs to evaluate (space-separated)"
+    )
+    parser.add_argument(
+        "--namespace", 
+        type=str, 
+        default=None,
+        help="Optional namespace parameter"
+    )
+    
+    args = parser.parse_args()
+    
+    main(
+        dataset_name=args.dataset_name,
+        predictions_path=args.predictions_path,
+        run_id=args.run_id,
+        split=args.split,
+        max_workers=args.max_workers,
+        rewrite_reports=args.rewrite_reports,
+        report_dir=args.report_dir,
+        instance_ids=args.instance_ids,
+        namespace=args.namespace,
+    )
