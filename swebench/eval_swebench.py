@@ -3,62 +3,53 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
-#     "morphcloud",
+#     "morphcloud>=0.1.49",
 #     "swebench",
 #     "fire",
 # ]
 #
 # [tool.uv.sources]
 # swebench = { git = "https://github.com/SWE-bench/SWE-bench" }
+# morphcloud = { git = "https://github.com/morph-labs/morph-python-sdk" }
 # ///
 
 """
 This script implements run_evaluation using Morph Cloud. It builds a snapshot
-via a chain of .setup() commands (including repository cloning and checkout
+via a chain of .exec() commands (including repository cloning and checkout
 using the environment_setup_commit), starting an instance, applying a patch,
 running tests and generating a report.
 """
 
+import json
+import logging
 import os
 import time
-import json
 import traceback
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from contextlib import contextmanager
-import logging
-from typing import Any, List, Optional, Dict, cast
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, cast
 
 # Configure logging (adjust level and format as needed)
 logging.basicConfig(
     level=logging.ERROR, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-from morphcloud.api import MorphCloudClient
-from swebench.harness.reporting import make_run_report
-from swebench.harness.utils import (
-    load_swebench_dataset,
-    get_predictions_from_file,
-    str2bool,
-)
-from swebench.harness.grading import get_eval_report
-from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
-from swebench.harness.constants import (
-    RUN_EVALUATION_LOG_DIR,
-    KEY_INSTANCE_ID,
-    KEY_PREDICTION,
-    LOG_REPORT,
-    KEY_MODEL,
-    APPLY_PATCH_FAIL,
-    APPLY_PATCH_PASS,
-    START_TEST_OUTPUT,
-    END_TEST_OUTPUT,
-)
-from swebench.harness.docker_build import setup_logger
-from swebench.harness.utils import EvaluationError
-
 import fire
+from morphcloud.api import MorphCloudClient
+
+from swebench.harness.constants import (APPLY_PATCH_FAIL, APPLY_PATCH_PASS,
+                                        END_TEST_OUTPUT, KEY_INSTANCE_ID,
+                                        KEY_MODEL, KEY_PREDICTION, LOG_REPORT,
+                                        RUN_EVALUATION_LOG_DIR,
+                                        START_TEST_OUTPUT)
+from swebench.harness.docker_build import setup_logger
+from swebench.harness.grading import get_eval_report
+from swebench.harness.reporting import make_run_report
+from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
+from swebench.harness.utils import (EvaluationError, get_predictions_from_file,
+                                    load_swebench_dataset, str2bool)
 
 
 @dataclass
@@ -81,42 +72,51 @@ def instance_snapshot_context(test_spec: TestSpec):
     Build the entire instance image
     """
     snapshot = client.snapshots.create(
-        vcpus=4, memory=16384, disk_size=32768, digest="swebench-base"
+        vcpus=4, memory=16384, disk_size=32768, digest="swebench-base3"
     )
+
+    # # use the base ubuntu container
+    snapshot = snapshot.as_container("ubuntu:22.04")
+
     # Common steps executed once
     snapshot = (
-        snapshot.setup("apt-get update -q")
-        .setup("apt install -y python3.11 python3.11-venv")
-        .setup("echo 'export DEBIAN_FRONTEND=noninteractive' >> ~/.bashrc")
-        .setup("echo 'export TZ=\"Etc/UTC\"' >> ~/.bashrc")
-        .setup(
-            "apt install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata patch"
+        snapshot.exec("apt-get update -q")
+        .exec("apt install -y python3.11 python3.11-venv")
+        .exec("echo 'export DEBIAN_FRONTEND=noninteractive' >> ~/.bashrc")
+        .exec("echo 'export TZ=\"Etc/UTC\"' >> ~/.bashrc")
+        .exec("echo 'export DEBIAN_FRONTEND=noninteractive' >> ~/.profile")
+        .exec("echo 'export TZ=\"Etc/UTC\"' >> ~/.profile")
+    )
+    snapshot = (
+        snapshot
+        .exec(
+            "export TZ=\"Etc/UTC\"; export DEBIAN_FRONTEND=noninteractive; apt install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata patch"
         )
         # Install Miniconda
-        .setup(
+        .exec(
             "wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O miniconda.sh"
         )
-        .setup("bash miniconda.sh -b -p /opt/miniconda3")
-        .setup("echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc")
-        .setup("/opt/miniconda3/bin/conda init --all")
-        .setup("/opt/miniconda3/bin/conda config --append channels conda-forge")
-        .setup("adduser --disabled-password --gecos 'dog' nonroot")
-        .setup("mkdir -p /testbed")
+        .exec("bash miniconda.sh -b -p /opt/miniconda3")
+        .exec("echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc")
+        .exec("/opt/miniconda3/bin/conda init --all")
+        .exec("/opt/miniconda3/bin/conda config --append channels conda-forge")
+        .exec("adduser --disabled-password --gecos 'dog' nonroot")
+        .exec("mkdir -p /testbed")
     )
 
     env_script = test_spec.setup_env_script
     if env_script:
         snapshot = (
-            snapshot.setup(
+            snapshot.exec(
                 f"""
                 cat > /root/setup_env.sh <<'EOF'
 {env_script}
 EOF
                    """
             )
-            .setup("chmod +x /root/setup_env.sh")
-            .setup("bash -c 'source ~/.bashrc && /root/setup_env.sh'")
-            .setup(
+            .exec("chmod +x /root/setup_env.sh")
+            .exec("bash -c 'source ~/.bashrc && /root/setup_env.sh'")
+            .exec(
                 "echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /root/.bashrc"
             )
         )
@@ -125,15 +125,15 @@ EOF
     repo_script = test_spec.install_repo_script
     if repo_script:
         snapshot = (
-            snapshot.setup(
+            snapshot.exec(
                 f"""
-                cat > /root/setup_repo.sh <<'EOF' 
+                cat > /root/setup_repo.sh <<'EOF'
 {repo_script}
 EOF
                 """
             )
-            .setup("chmod +x /root/setup_repo.sh")
-            .setup("bash /root/setup_repo.sh")
+            .exec("export TZ=\"Etc/UTC\"; export DEBIAN_FRONTEND=noninteractive;  chmod +x /root/setup_repo.sh")
+            .exec("export TZ=\"Etc/UTC\"; export DEBIAN_FRONTEND=noninteractive;  bash /root/setup_repo.sh")
         )
 
     with client.instances.start(snapshot.id, ttl_seconds=3600) as instance:
